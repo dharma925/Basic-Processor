@@ -43,7 +43,7 @@ Local buffer / SRAM abstraction (feeds the MAC array, holds partial results)
 
 - [x] Tensor abstraction (shape, storage, indexing) — `include/tensor.hpp`
 - [x] CNN ops (conv, matmul, ReLU, pool, FC) — `include/ops.hpp`
-- [ ] Accelerator abstraction (MAC array, accumulator, buffer model)
+- [x] Accelerator abstraction (MAC array, accumulator, buffer model) — `include/accelerator.hpp`, `src/accelerator.cpp`
 - [ ] Trained weights from a real small CNN (PyTorch -> exported format)
 - [ ] Python vs C++ functional correctness comparison
 - [ ] Performance model (cycles, MAC utilization, memory traffic)

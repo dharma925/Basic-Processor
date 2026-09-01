@@ -93,8 +93,65 @@ can differ from a true hardware arithmetic shifter by at most 1 LSB on negative
 values. Called out here rather than left implicit, per this project's rule: never
 claim behavior the model doesn't actually have.
 
+## Accelerator abstraction (`include/accelerator.hpp`, `src/accelerator.cpp`)
+
+Four pieces, composed bottom-up:
+
+- **`MacUnit`** — one multiply-accumulate + its accumulator register. The atomic PE
+  (processing element), analogous to a single `mac_pe` module instantiated many times
+  in RTL via a `generate` block.
+- **`MacArray`** — a configurable `rows x cols` grid of `MacUnit`s. Given an `(R,K)`
+  activation tile and a `(K,C)` weight tile (`R<=rows`, `C<=cols`), `computeTile()`
+  returns the `(R,C)` output tile: `out(r,c) = sum_k input(r,k) * weight(k,c)`. This is
+  the GEMM shape both convolution (via an im2col-style mapping) and a fully-connected
+  layer get reduced to.
+- **`LocalBuffer<T>`** — bounded on-chip storage (capacity in elements) that a tile
+  must be staged into before the array can consume it; `store()` throws if the tile
+  doesn't fit. Models an SRAM macro's fixed capacity as an actual constraint, not just
+  a comment.
+- **`Accelerator`** — the tiling controller. Owns one `MacArray` and two
+  `LocalBuffer<int8_t>` instances (activation, weight) and implements `conv2d`/
+  `fullyConnected` by partitioning the workload into `<=rows x <=cols` tiles, staging
+  each into the buffers, and calling `computeTile()`.
+
+**Correctness contract.** `Accelerator::conv2d`/`fullyConnected` must produce results
+identical to the flat reference ops (`ops.hpp`) for the same inputs — same idea as
+comparing a DUT against a golden reference model in a verification testbench, just
+with the "DUT" being a differently-structured but equivalent implementation.
+`tests/test_accelerator.cpp` checks this against random inputs, uneven tile
+boundaries (array size that doesn't evenly divide the workload), padding, and
+stride > 1. It holds bit-for-bit, not just "close," because integer addition is
+exactly associative/commutative — there's no floating-point reordering error to
+worry about when re-grouping the same multiply-accumulates into tiles.
+
+**What `MacArray` does *not* model, on purpose.** No PE-to-PE forwarding, no
+systolic dataflow — each PE independently completes its full K-deep reduction inside
+one `computeTile()` call. That is a real simplification versus how, say, a
+weight-stationary systolic array actually moves data cycle-by-cycle; it's called out
+explicitly here rather than left implicit, because Phase 2/3 will start reasoning
+about cycles and dataflow, and it matters that the model's limits are known before
+numbers get attached to them.
+
+**An early utilization observation (real, not seeded for later).**
+`Accelerator::fullyConnected` maps `x` as a single row (`R=1`) against the array —
+which means only 1 of `mac_rows` rows of PEs is ever active for an FC layer executed
+this way, no matter how large the array is configured. That's already visible in
+Phase 1, before any cycle counting exists: a workload's *shape* can fail to fill an
+array regardless of the array's size. Phase 3 will quantify this as MAC utilization
+and connect it to "why adding more MACs can fail to improve performance."
+
+**Header/source split.** `Tensor<T>` and everything in `ops.hpp` are templates or
+inline functions, so they live entirely in headers — the compiler needs their full
+body at every instantiation site. `Accelerator` is a concrete class (no template
+parameter), so unlike those, its member function bodies live in `src/accelerator.cpp`
+and get compiled once into a real `.o`/static library (`accel_lib`) that other files
+just declare against via the header. This is the first real use of `src/` in this
+project, and the split is deliberate: it's the same declaration/implementation
+separation as a module's port list versus its internal behavioral logic — the caller
+only needs to know the interface, not the body, to link against it.
+
 ## Next
 
-The accelerator abstraction: MAC units, an accumulator, a local buffer/SRAM model,
-and configurable array dimensions — routing `conv2d`/`fully_connected`'s math through
-an explicit hardware-shaped execution model instead of a flat loop.
+Train a small CNN on MNIST in PyTorch, quantize its weights to INT8, and export them
+in a format the C++ model can load — then run the same image through the Python
+reference and both C++ paths (`ops::conv2d` and `Accelerator::conv2d`) and compare.
