@@ -64,6 +64,22 @@ static void test_out_of_bounds_throws() {
     CHECK_THROWS(t.at({0}));      // wrong rank
 }
 
+static void test_reshape() {
+    Tensor<int32_t> t({2, 3});  // [[0,1,2],[3,4,5]]
+    for (int i = 0; i < 6; ++i) t.data()[i] = i;
+
+    Tensor<int32_t> flat = t.reshape({6});
+    for (int i = 0; i < 6; ++i) CHECK_EQ(flat(static_cast<size_t>(i)), i);
+
+    Tensor<int32_t> reshaped = t.reshape({3, 2});  // [[0,1],[2,3],[4,5]]
+    CHECK_EQ(reshaped(0, 0), 0);
+    CHECK_EQ(reshaped(0, 1), 1);
+    CHECK_EQ(reshaped(1, 0), 2);
+    CHECK_EQ(reshaped(2, 1), 5);
+
+    CHECK_THROWS(t.reshape({4}));  // element count mismatch
+}
+
 static void test_4d_nchw_shape() {
     // A realistic activation tensor shape: batch=1, channels=3, height=8, width=8.
     Tensor<int8_t> t({1, 3, 8, 8});
@@ -78,6 +94,7 @@ int main() {
     test_indexing_roundtrip();
     test_row_major_layout();
     test_fill();
+    test_reshape();
     test_out_of_bounds_throws();
     test_4d_nchw_shape();
 

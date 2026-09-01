@@ -226,9 +226,74 @@ not a general claim about INT8 quantization; a deeper network or a harder datase
 would likely show a larger gap, and per-channel or asymmetric quantization typically
 narrows it further versus the per-tensor symmetric scheme used here.
 
+## Running the trained model in C++, and the Python-vs-C++ comparison
+
+Three additions close the loop between the trained/quantized model (Python) and the
+functional model (C++):
+
+- **`requantize(acc, double scale)`** (`ops.hpp`) — a second overload alongside the
+  original power-of-two-shift version, using a calibrated float scale (the
+  `requant_scale_conv1` exported by `export_int8.py`) instead. Rounding is
+  round-half-away-from-zero via `std::lround`, chosen specifically to match
+  `quantized_reference.py`'s `requantize()` bit-for-bit (that script deliberately
+  avoids numpy's default round-half-to-even for the same reason). Documented
+  simplification: real accelerator hardware would implement this scale multiply as
+  an integer fixed-point multiply + shift, to keep floating point out of the
+  datapath entirely; this overload does a plain double-precision multiply instead —
+  numerically correct, but not a model of that specific multiplier circuit.
+- **`Tensor<T>::reshape()`** (`tensor.hpp`) — turns the pooled `(C,H,W)` activation
+  into the flat `(C*H*W,)` vector `fully_connected` expects. Valid without copying
+  logic because storage is row-major/contiguous, so reinterpreting shape moves no
+  data. Its one-line implementation (`out.data_ = data_;`) is a small but genuine
+  C++ point: access control in C++ is *per-class*, not *per-object* — a `Tensor<T>`
+  member function can reach into the private members of any other `Tensor<T>`
+  instance, not just `*this`.
+- **`WeightLoader`** (`include/weight_loader.hpp`, `src/weight_loader.cpp`) — reads
+  the binary container `scripts/model_io.py` writes: magic bytes, then named tensors
+  (dtype tag, shape, raw bytes), bulk-read straight into each `Tensor<T>`'s
+  contiguous storage via `data()` (no per-element parsing needed). A loaded tensor's
+  concrete type (`Tensor<int8_t>`, `Tensor<int32_t>`, or `Tensor<float>`) isn't known
+  until the dtype byte is read at runtime, which is exactly the situation
+  `std::variant` is for: a type-safe tagged union that can hold exactly one of a
+  fixed set of alternatives and tracks which — asking for the wrong one throws
+  `std::bad_variant_access` instead of silently reinterpreting bytes the way a raw
+  C `union` would. The `DType` enum mirrors the Python writer's dtype tag values
+  exactly; it's not a locally-chosen convenience enum, it *is* part of the file
+  format, the same way an opcode field's numeric values are fixed by the hardware
+  interface that reads them, not by whichever piece of code happens to define the
+  enum. Documented limitation: the reader assumes a little-endian host and does no
+  byte-swapping — true for this project's x86_64 target, not portable in general.
+- **`mnist_infer`** (`src/mnist_infer.cpp`) — an executable (not a test) that loads
+  the exported model, runs `conv1 -> relu -> requantize -> maxpool -> flatten -> fc`
+  on each exported test image through *both* `accel::conv2d` (flat reference) and
+  `Accelerator::conv2d` (tiled MAC-array model), confirms they still agree on real
+  data (not just the synthetic random tensors in `test_accelerator.cpp`), and writes
+  per-image predictions and logits to `results/cpp_predictions.csv`.
+
+**The comparison itself** (`scripts/compare_cpp_python.py`): reruns
+`quantized_reference.py`'s independent numpy implementation on the same exported
+images and diffs its logits against `mnist_infer`'s CSV output, logit-by-logit.
+
+Result (actually run, `results/cpp_predictions.csv`, 20 exported test images):
+
+```
+max |python_logit - cpp_logit| over all images/classes: 0
+Python reference and C++ model agree EXACTLY on every image and every logit.
+```
+
+Bit-exact, not merely close — expected here, not lucky: the shared datapath is pure
+integer arithmetic (INT8 x INT8 -> INT32 accumulate) except for one scale multiply in
+`requantize()`, and both sides use matching round-half-away-from-zero rounding for
+that step specifically so this comparison would be meaningful rather than "close
+enough, probably fine." `mnist_infer` additionally confirms 0 disagreements between
+the flat reference and the tiled `Accelerator` path on these same 20 real images,
+reinforcing (on real data, not just `test_accelerator.cpp`'s synthetic tensors) that
+tiling the workload onto a MAC array changes nothing about the answer — only, from
+Phase 2 onward, how long it takes to get there.
+
 ## Next
 
-Add a matching `requantize(acc, scale)` overload to the C++ side (the existing
-power-of-two-shift version stays as the illustrative simple case), a weight-loader
-for the exported `.bin` format, and a small C++ inference CLI — then run it against
-the same exported test images as `quantized_reference.py` and compare.
+Phase 2: instrument the accelerator model with cycle/traffic counters — MAC
+operation counts, estimated cycles, memory reads/writes, buffer accesses, MAC
+utilization — and document the cycle model this project actually uses (not claiming
+RTL accuracy it doesn't have).

@@ -52,6 +52,23 @@ public:
 
     void fill(T value) { std::fill(data_.begin(), data_.end(), value); }
 
+    // Returns a new Tensor with the same underlying elements under a
+    // different shape (same total element count required) -- e.g. turning a
+    // (C,H,W) activation tensor into the flat (C*H*W,) vector a
+    // fully-connected layer expects. Valid because storage is row-major and
+    // contiguous: reinterpreting a contiguous buffer's shape moves no bytes,
+    // it only changes how indices map onto the same data.
+    Tensor<T> reshape(std::vector<size_t> new_shape) const {
+        if (numElements(new_shape) != size()) {
+            throw std::invalid_argument("Tensor::reshape: element count mismatch");
+        }
+        Tensor<T> out(std::move(new_shape));
+        out.data_ = data_;  // Tensor<T> can access another Tensor<T>'s private
+                             // members here -- in C++, access control is
+                             // per-class, not per-object.
+        return out;
+    }
+
     T* data() { return data_.data(); }
     const T* data() const { return data_.data(); }
 

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -228,6 +229,37 @@ inline Tensor<int8_t> requantize(const Tensor<int32_t>& acc, int shift) {
         int32_t v = src[i] / divisor;
         v = std::clamp(v, static_cast<int32_t>(std::numeric_limits<int8_t>::min()),
                         static_cast<int32_t>(std::numeric_limits<int8_t>::max()));
+        dst[i] = static_cast<int8_t>(v);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// requantize (calibrated-scale overload): INT32 -> INT8 using a single
+// per-layer float scale computed offline (see scripts/export_int8.py's
+// requant_scale_conv1), rather than the power-of-two shift above. This is
+// what a real post-training-quantization pipeline actually produces, and
+// it's the overload used to run this model on real trained weights.
+//
+// Rounding is round-half-away-from-zero (std::lround's documented behavior),
+// chosen deliberately to match scripts/quantized_reference.py's requantize()
+// bit-for-bit -- that script avoids numpy's default round-half-to-even for
+// exactly this reason. Two independently-written implementations agreeing
+// exactly, not just approximately, is the whole point of the Python-vs-C++
+// comparison this overload exists for.
+//
+// Documented simplification: real INT8 accelerator hardware implements a
+// per-tensor scale as an integer fixed-point multiply + shift, specifically
+// to avoid floating point in the datapath. This overload does a plain
+// double-precision multiply instead -- numerically fine for a functional
+// model, but not a model of that specific multiplier circuit.
+inline Tensor<int8_t> requantize(const Tensor<int32_t>& acc, double scale) {
+    Tensor<int8_t> out(acc.shape());
+    const int32_t* src = acc.data();
+    int8_t* dst = out.data();
+    for (size_t i = 0; i < acc.size(); ++i) {
+        long v = std::lround(static_cast<double>(src[i]) * scale);
+        v = std::clamp<long>(v, std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max());
         dst[i] = static_cast<int8_t>(v);
     }
     return out;

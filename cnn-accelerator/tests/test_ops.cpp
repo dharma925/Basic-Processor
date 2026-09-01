@@ -148,6 +148,23 @@ static void test_requantize() {
     CHECK_EQ(static_cast<int>(out(7)), -3);    // -7/2 truncates to -3
 }
 
+static void test_requantize_float_scale() {
+    // scale = 0.5, same effective divisor as the shift=1 test above, but via
+    // the calibrated-scale overload -- checks round-half-away-from-zero and
+    // saturation behavior distinct from the truncating shift/divide overload.
+    Tensor<int32_t> acc({6});
+    int32_t vals[6] = {10, -10, 5, -5, 300, -300};  // 5/0.5=2.5, -5/0.5=-2.5 -> round-half-away-from-zero
+    for (int i = 0; i < 6; ++i) acc.data()[i] = vals[i];
+
+    Tensor<int8_t> out = requantize(acc, 0.5);
+    CHECK_EQ(static_cast<int>(out(0)), 5);     // 10*0.5=5
+    CHECK_EQ(static_cast<int>(out(1)), -5);    // -10*0.5=-5
+    CHECK_EQ(static_cast<int>(out(2)), 3);     // 5*0.5=2.5 -> rounds away from zero to 3
+    CHECK_EQ(static_cast<int>(out(3)), -3);    // -5*0.5=-2.5 -> rounds away from zero to -3
+    CHECK_EQ(static_cast<int>(out(4)), 127);   // 300*0.5=150 -> saturates to 127
+    CHECK_EQ(static_cast<int>(out(5)), -128);  // -300*0.5=-150 -> saturates to -128
+}
+
 int main() {
     test_conv2d_no_padding();
     test_conv2d_with_bias();
@@ -157,6 +174,7 @@ int main() {
     test_relu_inplace();
     test_maxpool2d();
     test_requantize();
+    test_requantize_float_scale();
 
     if (g_failures == 0) {
         std::cout << "All ops tests passed.\n";

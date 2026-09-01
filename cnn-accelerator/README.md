@@ -45,7 +45,7 @@ Local buffer / SRAM abstraction (feeds the MAC array, holds partial results)
 - [x] CNN ops (conv, matmul, ReLU, pool, FC) — `include/ops.hpp`
 - [x] Accelerator abstraction (MAC array, accumulator, buffer model) — `include/accelerator.hpp`, `src/accelerator.cpp`
 - [x] Trained weights from a real small CNN (PyTorch -> exported format) — `scripts/train.py`, `scripts/export_int8.py`
-- [ ] Python vs C++ functional correctness comparison
+- [x] Python vs C++ functional correctness comparison — `src/mnist_infer.cpp`, `scripts/compare_cpp_python.py`: **bit-exact match**, 0 diff on every logit, every image
 - [ ] Performance model (cycles, MAC utilization, memory traffic)
 - [ ] Architectural experiments (4x4 / 8x8 / 16x16 MAC array sweep)
 - [ ] One optimization with before/after comparison
@@ -72,14 +72,20 @@ python3 quantized_reference.py       # sanity-checks the export on 20 images
 python3 eval_quantized_accuracy.py   # float vs INT8 accuracy, full test set
 ```
 
-## Build & test
+## Build, test, and run on real weights
 
 ```sh
 cd cnn-accelerator
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+
+./build/mnist_infer                          # runs the trained model, writes results/cpp_predictions.csv
+python3 scripts/compare_cpp_python.py        # diffs it against the independent numpy reference
 ```
+
+The Python-vs-C++ comparison currently reports a bit-exact match — `max |python_logit
+- cpp_logit| = 0` across all 20 exported test images and all 10 output classes each.
 
 ## Layout
 
