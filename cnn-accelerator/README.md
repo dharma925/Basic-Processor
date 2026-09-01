@@ -44,11 +44,33 @@ Local buffer / SRAM abstraction (feeds the MAC array, holds partial results)
 - [x] Tensor abstraction (shape, storage, indexing) — `include/tensor.hpp`
 - [x] CNN ops (conv, matmul, ReLU, pool, FC) — `include/ops.hpp`
 - [x] Accelerator abstraction (MAC array, accumulator, buffer model) — `include/accelerator.hpp`, `src/accelerator.cpp`
-- [ ] Trained weights from a real small CNN (PyTorch -> exported format)
+- [x] Trained weights from a real small CNN (PyTorch -> exported format) — `scripts/train.py`, `scripts/export_int8.py`
 - [ ] Python vs C++ functional correctness comparison
 - [ ] Performance model (cycles, MAC utilization, memory traffic)
 - [ ] Architectural experiments (4x4 / 8x8 / 16x16 MAC array sweep)
 - [ ] One optimization with before/after comparison
+
+## Trained model
+
+`Conv2d(1->8,3x3,pad=1) -> ReLU -> MaxPool(2x2) -> Flatten -> Linear(1568->10)`,
+trained on MNIST (3 epochs, plain PyTorch), then post-training quantized to INT8
+(per-tensor symmetric). See `docs/architecture.md` for the full quantization scheme.
+
+Measured on the full 10,000-image MNIST test set:
+
+| | accuracy |
+|---|---|
+| float32 | 96.46% |
+| INT8 (this project's quantized model) | 96.43% |
+
+```sh
+cd cnn-accelerator/scripts
+pip install -r requirements.txt
+python3 train.py            # trains, saves models/mnist_fp32.pt
+python3 export_int8.py      # quantizes + exports models/mnist_int8_model.bin
+python3 quantized_reference.py       # sanity-checks the export on 20 images
+python3 eval_quantized_accuracy.py   # float vs INT8 accuracy, full test set
+```
 
 ## Build & test
 

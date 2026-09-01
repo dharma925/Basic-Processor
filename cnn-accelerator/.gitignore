@@ -4,3 +4,9 @@ build/
 __pycache__/
 *.pyc
 .venv/
+
+# Raw MNIST download and intermediate float32 checkpoint: large, reproducible
+# via `python3 scripts/train.py`. Only the quantized export
+# (models/mnist_int8_model.bin) -- the actual C++-consumable artifact -- is committed.
+models/mnist_raw/
+models/mnist_fp32.pt

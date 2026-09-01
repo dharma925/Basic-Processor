@@ -150,8 +150,85 @@ project, and the split is deliberate: it's the same declaration/implementation
 separation as a module's port list versus its internal behavioral logic — the caller
 only needs to know the interface, not the body, to link against it.
 
+## Trained model, quantization, and export (`scripts/`)
+
+The network (`scripts/train.py`, `SmallCNN`): `Conv2d(1->8, 3x3, pad=1) -> ReLU ->
+MaxPool(2x2) -> Flatten -> Linear(1568->10)`, trained on MNIST in ordinary float32
+PyTorch. One instance of each op the C++ model implements, on purpose — every layer
+has a direct counterpart in `ops.hpp`/`accelerator.hpp`. Training itself is
+unremarkable (Adam, cross-entropy, a few epochs) and deliberately kept separate from
+quantization: `train.py`'s only job is to produce the best float model it can.
+
+**Quantization (`scripts/export_int8.py`): per-tensor symmetric INT8**, chosen for
+simplicity over accuracy-maximizing schemes (per-channel, asymmetric, etc.) — this
+project's point is hardware/performance modeling, not squeezing out the last point of
+quantized accuracy. `scale = max(abs(calibration values)) / 127`; a value quantizes as
+`round(x / scale)`, clipped to `[-127, 127]`.
+
+- **Input scale** is fixed, not calibrated: MNIST pixels (after `ToTensor()`) are in
+  `[0, 1]` and never negative, so `scale_input = 1/127` maps them onto `[0, 127]` —
+  intentionally using only the positive half of INT8's range, in exchange for a
+  scale that needs no calibration data at all.
+- **Weight scales** are computed directly from each trained weight tensor (no
+  calibration data needed — the weights themselves define their own range).
+- **The one activation scale that *is* calibrated** — `scale_conv1_out`, the range of
+  the post-ReLU conv1 output — comes from running ~200 training images through the
+  *float* model and taking the max absolute activation value. This is standard
+  post-training-quantization practice: size a layer's INT8 range from the
+  full-precision model's own statistics, not a guess.
+- **Bias values are stored pre-divided into the accumulator's implied units**
+  (`scale_in * scale_weight` for that layer), because that's the domain the INT32
+  accumulator is already in before any requantization happens —
+  `bias_int32 = round(bias_real / (scale_in * scale_weight))`.
+- **The final FC layer's output is left as raw INT32**, not requantized to INT8: a
+  single per-tensor scale multiplies every output element identically, so
+  `argmax(int32 logits) == argmax(real logits)` — there's no need to narrow precision
+  on a layer whose only consumer is an argmax.
+- **ReLU and MaxPool both operate directly on the wider intermediate values**
+  (ReLU on the INT32 accumulator, pooling's `max` after requantization to INT8) —
+  valid because both `relu(x)` and `max(...)` commute with a positive scale factor,
+  so it doesn't matter whether "scale conversion" or "the nonlinearity" happens first.
+
+**Export format (`scripts/model_io.py`).** A small custom binary container — magic +
+version + a list of named tensors (`name`, dtype tag, shape, raw little-endian bytes)
+— rather than JSON/pickle/npz. The point: the C++ *reader* can be a plain
+`std::ifstream` parsing documented raw bytes, no third-party library needed on either
+side. This is the same kind of artifact a DV engineer already works with when loading
+a `.mem`/`.hex` file into a simulated memory — a flat, documented layout instead of a
+black-box format. `models/mnist_int8_model.bin` carries the quantized weights/biases,
+the single `requant_scale_conv1` scalar, and a batch of already-quantized test images
++ labels (so the C++ side and the Python reference run inference on *identical*
+inputs later).
+
+**Python reference implementation (`scripts/quantized_reference.py`).** A from-scratch
+numpy implementation of the same INT8 pipeline (`conv2d_int8`, `relu`, `requantize`,
+`maxpool2d_int8`, `fully_connected_int8`) — not a call back into PyTorch. This is the
+project's required "Python result vs C++ functional model" comparison target, and
+it's implemented independently of the C++ code for the same reason a DV testbench's
+golden model is kept independent of the DUT: agreement between two differently-built
+implementations is real evidence, agreement between one implementation and a copy of
+itself is not. `requantize`'s rounding is deliberately round-half-away-from-zero
+(matching C++'s `std::lround`, not numpy's default round-half-to-even) specifically
+so the two sides can be compared bit-for-bit rather than merely "close."
+
+**Measured results** (`scripts/eval_quantized_accuracy.py`, full 10,000-image MNIST
+test set, actually run — not assumed):
+
+| | accuracy |
+|---|---|
+| float32 (PyTorch, 3 epochs) | 96.46% |
+| INT8 (per-tensor symmetric, this scheme) | 96.43% |
+| delta | -0.03 pts |
+
+Quantization cost 0.03 percentage points of accuracy on this model/dataset. That's a
+real, measured result of this specific simple scheme on this specific tiny network —
+not a general claim about INT8 quantization; a deeper network or a harder dataset
+would likely show a larger gap, and per-channel or asymmetric quantization typically
+narrows it further versus the per-tensor symmetric scheme used here.
+
 ## Next
 
-Train a small CNN on MNIST in PyTorch, quantize its weights to INT8, and export them
-in a format the C++ model can load — then run the same image through the Python
-reference and both C++ paths (`ops::conv2d` and `Accelerator::conv2d`) and compare.
+Add a matching `requantize(acc, scale)` overload to the C++ side (the existing
+power-of-two-shift version stays as the illustrative simple case), a weight-loader
+for the exported `.bin` format, and a small C++ inference CLI — then run it against
+the same exported test images as `quantized_reference.py` and compare.
