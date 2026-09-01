@@ -36,9 +36,65 @@ Design choices and why:
   once per parameter set at elaboration time but from a single compiled description).
   That's why there's no `tensor.cpp` — the definition has to live in the header.
 
+## CNN operations (`include/ops.hpp`)
+
+Free functions over `Tensor<T>`: `conv2d`, `matmul`, `fully_connected`, `relu_inplace`,
+`maxpool2d`, `requantize`. Pure functional references — correctness only, still no
+notion of cycles or parallel execution. That comes next, in the accelerator model,
+which will *reuse* this same math but execute it through a MAC-array/buffer
+abstraction instead of a flat CPU loop.
+
+**Why `conv2d`'s loop nest matters beyond correctness.** It's 6 loops deep:
+`(c_out, h_out, w_out)` for the output grid, `(c_in, kh, kw)` for the MAC-heavy inner
+reduction. That inner triple loop — `c_in * kh * kw` multiply-accumulates per output
+pixel — is *exactly* the work the accelerator model will later tile across a
+configurable MAC array. Reading this loop now is reading the workload the hardware
+has to execute; nothing changes about the math later, only how (and how fast) it's
+carried out.
+
+**`std::optional<Tensor<int32_t>>` for bias.** Bias-add is a real but optional
+hardware feature — some accelerator datapaths have a bias-add stage wired into the
+accumulator, some don't. `std::optional` forces the caller to explicitly check
+`bias.has_value()` (or use `bias->...`) before using it, the same discipline a
+"valid" bit demands before you trust the data behind it — the compiler won't let you
+silently read a bias that was never provided.
+
+**Padding via signed index arithmetic, not a padded copy.** `conv2d` computes
+`ih`/`iw` as `long` (can go negative) and skips MAC taps that land outside the real
+input — that's zero-padding without materializing a padded buffer. This mirrors how
+an accelerator's address generator would gate accesses at the buffer boundary rather
+than allocating extra zero-filled SRAM.
+
+**Two matrix-multiply-shaped ops, on purpose.** `matmul` is the general `(M,K)x(K,N)`
+primitive; `fully_connected` hand-rolls the specific `(K,)x(N,K)+bias -> (N,)` case
+because that's the literal shape PyTorch's `nn.Linear` weights export in
+(`out_features, in_features`), and because a matvec is the concrete unit of work that
+later gets mapped one row at a time onto the MAC array.
+
+**`relu_inplace` and `maxpool2d` are templated on `T`.** Both need to run on
+whatever precision the data is currently at — raw INT32 accumulator output right
+after `conv2d`, or INT8 after `requantize()` — without duplicating the function per
+type.
+
+**`requantize`: INT32 accumulator -> INT8, via shift + saturate.** A real
+accelerator can't accumulate in wide INT32 forever between layers; results get
+written back to the (narrow) activation buffer at reduced precision so the *next*
+layer's MAC array can consume INT8 operands again. The right-shift approximates
+dividing by a per-layer power-of-two scale factor; clamping to `[-128, 127]` instead
+of wrapping on overflow mirrors how fixed-point DSP/MAC hardware is normally built
+(saturating arithmetic, not silent wraparound).
+
+*Documented deviation from true HW behavior*: the shift is implemented as integer
+division rather than a raw `>>`, because right-shift of a negative signed integer is
+only guaranteed to be an arithmetic (floor) shift as of C++20 — under C++17 it's
+implementation-defined (even though every mainstream compiler does the obvious
+two's-complement thing). Division truncates toward zero instead of flooring, which
+can differ from a true hardware arithmetic shifter by at most 1 LSB on negative
+values. Called out here rather than left implicit, per this project's rule: never
+claim behavior the model doesn't actually have.
+
 ## Next
 
-CNN operations (convolution, matmul, ReLU, pooling, fully connected) will be added as
-free functions over `Tensor<T>` in `include/`, each documented with its own hardware
-framing (e.g. convolution's nested loop structure directly foreshadows the tiling and
-MAC-array mapping done in the accelerator model).
+The accelerator abstraction: MAC units, an accumulator, a local buffer/SRAM model,
+and configurable array dimensions — routing `conv2d`/`fully_connected`'s math through
+an explicit hardware-shaped execution model instead of a flat loop.
