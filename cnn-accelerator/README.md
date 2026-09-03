@@ -46,7 +46,7 @@ Local buffer / SRAM abstraction (feeds the MAC array, holds partial results)
 - [x] Accelerator abstraction (MAC array, accumulator, buffer model) — `include/accelerator.hpp`, `src/accelerator.cpp`
 - [x] Trained weights from a real small CNN (PyTorch -> exported format) — `scripts/train.py`, `scripts/export_int8.py`
 - [x] Python vs C++ functional correctness comparison — `src/mnist_infer.cpp`, `scripts/compare_cpp_python.py`: **bit-exact match**, 0 diff on every logit, every image
-- [ ] Performance model (cycles, MAC utilization, memory traffic)
+- [x] Performance model (cycles, MAC utilization, memory traffic) — `PerfCounters` in `include/accelerator.hpp`; see `docs/performance_model.md`
 - [ ] Architectural experiments (4x4 / 8x8 / 16x16 MAC array sweep)
 - [ ] One optimization with before/after comparison
 
@@ -86,6 +86,18 @@ python3 scripts/compare_cpp_python.py        # diffs it against the independent 
 
 The Python-vs-C++ comparison currently reports a bit-exact match — `max |python_logit
 - cpp_logit| = 0` across all 20 exported test images and all 10 output classes each.
+
+`mnist_infer` also prints a performance characterization from the model's
+`PerfCounters` (default 4x4 MAC array, 16 elements/cycle buffer bandwidth):
+
+| layer | mac_ops | utilization | total_cycles |
+|---|---|---|---|
+| conv1 | 56,448 | 100.0% | 5,880 |
+| fc    | 15,680 | 20.8%  | 5,782 |
+| **total** | 72,128 | 54.8% | **11,662** |
+
+The full cycle model (exact formulas, and what it deliberately does not claim to
+model) is in `docs/performance_model.md`.
 
 ## Layout
 

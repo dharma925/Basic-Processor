@@ -5,6 +5,15 @@
 
 namespace accel {
 
+namespace {
+
+// Round a/b up to the nearest whole cycle: loading a partial buffer-width's
+// worth of data still costs a full cycle, the same reason a burst transfer
+// that doesn't fill its last beat still takes that whole beat.
+size_t ceilDiv(size_t a, size_t b) { return (a + b - 1) / b; }
+
+}  // namespace
+
 Accelerator::Accelerator(AcceleratorConfig config)
     : config_(config),
       mac_array_(config.mac_rows, config.mac_cols),
@@ -95,6 +104,18 @@ Tensor<int32_t> Accelerator::conv2d(const Tensor<int8_t>& input, const Tensor<in
             Tensor<int32_t> partial =
                 mac_array_.computeTile(activation_buffer_.contents(), weight_buffer_.contents());
 
+            // Performance counters for this one (pixel-tile, channel-tile)
+            // GEMM tile -- see docs/performance_model.md for the cycle model
+            // these numbers implement.
+            const size_t bw = config_.buffer_bandwidth_elems_per_cycle;
+            stats_.load_cycles += ceilDiv(input_tile.size(), bw) + ceilDiv(weight_tile.size(), bw);
+            stats_.compute_cycles += k;
+            stats_.mac_ops += r_tile * c_tile * k;
+            stats_.mac_capacity_ops += config_.mac_rows * config_.mac_cols * k;
+            stats_.activation_bytes_loaded += input_tile.size();
+            stats_.weight_bytes_loaded += weight_tile.size();
+            stats_.tile_count += 1;
+
             for (size_t r = 0; r < r_tile; ++r) {
                 const size_t p = ps + r;
                 const size_t oh = p / w_out;
@@ -136,11 +157,19 @@ Tensor<int32_t> Accelerator::fullyConnected(const Tensor<int8_t>& x, const Tenso
 
     Tensor<int32_t> output({n});
 
+    const size_t bw = config_.buffer_bandwidth_elems_per_cycle;
+
     Tensor<int8_t> input_tile({size_t{1}, k});
     for (size_t i = 0; i < k; ++i) {
         input_tile(0, i) = x(i);
     }
     activation_buffer_.store(input_tile);
+    // x is staged into the activation buffer exactly once and reused across
+    // every output-channel tile below -- unlike conv2d, where a fresh input
+    // tile is gathered and reloaded for every tile. This one load's cost is
+    // counted here, once, not once per column tile.
+    stats_.load_cycles += ceilDiv(input_tile.size(), bw);
+    stats_.activation_bytes_loaded += input_tile.size();
 
     for (size_t cs = 0; cs < n; cs += config_.mac_cols) {
         const size_t c_tile = std::min(config_.mac_cols, n - cs);
@@ -155,6 +184,14 @@ Tensor<int32_t> Accelerator::fullyConnected(const Tensor<int8_t>& x, const Tenso
 
         Tensor<int32_t> partial =
             mac_array_.computeTile(activation_buffer_.contents(), weight_buffer_.contents());
+
+        stats_.load_cycles += ceilDiv(weight_tile.size(), bw);
+        stats_.compute_cycles += k;
+        stats_.mac_ops += c_tile * k;  // R is always 1 here -- see the class comment above
+        stats_.mac_capacity_ops += config_.mac_rows * config_.mac_cols * k;
+        stats_.weight_bytes_loaded += weight_tile.size();
+        stats_.tile_count += 1;
+
         for (size_t c = 0; c < c_tile; ++c) {
             int32_t val = partial(0, c);
             if (bias) {

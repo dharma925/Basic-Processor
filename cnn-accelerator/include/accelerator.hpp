@@ -1,10 +1,9 @@
 // The accelerator abstraction: MAC units -> MAC array -> local buffer/SRAM
 // -> a tiling controller (Accelerator) that maps conv2d/fully_connected onto
-// them. Still Phase 1 (functional correctness only) -- no cycle counting or
-// timing yet. The point of this file is to go from "a flat CPU loop computes
-// the right answer" (ops.hpp) to "a hardware-shaped execution model computes
-// the same right answer" -- the structure this builds is what Phase 2 will
-// instrument with cycle/traffic counters.
+// them, instrumented with PerfCounters (cycles, MAC utilization, memory
+// traffic) -- see docs/performance_model.md for the exact cycle model and,
+// importantly, what it does and doesn't claim to model accurately. This is
+// explicitly a functional/performance model, not RTL-cycle-accurate.
 #pragma once
 
 #include <cstdint>
@@ -135,15 +134,64 @@ private:
     Tensor<T> contents_{std::vector<size_t>{0}};
 };
 
-// Configuration for an Accelerator instance: MAC array shape and buffer
-// sizes. A plain struct (aggregate), not a class -- there's no behavior to
-// encapsulate, just a parameter record, the software equivalent of a
-// hardware module's `parameter`/`localparam` block at instantiation time.
+// Configuration for an Accelerator instance: MAC array shape, buffer sizes,
+// and the one timing parameter this model has -- how fast a tile can be
+// staged into the local buffers. A plain struct (aggregate), not a class --
+// there's no behavior to encapsulate, just a parameter record, the software
+// equivalent of a hardware module's `parameter`/`localparam` block at
+// instantiation time.
 struct AcceleratorConfig {
     size_t mac_rows = 4;
     size_t mac_cols = 4;
     size_t activation_buffer_elems = 4096;
     size_t weight_buffer_elems = 4096;
+
+    // Elements-per-cycle the local buffers can be loaded at. Since every
+    // buffer in this model stores int8_t, "elements" and "bytes" coincide
+    // here -- a wider element type would need this split into separate
+    // elements/bytes handling, which this model doesn't do. This number is
+    // an illustrative, configurable knob, not derived from a real SRAM/bus
+    // datasheet -- see docs/performance_model.md.
+    size_t buffer_bandwidth_elems_per_cycle = 16;
+};
+
+// Performance counters accumulated by an Accelerator as it runs. The same
+// idea as a hardware performance-monitoring unit (PMU): counters that
+// accumulate during execution and that a caller reads and optionally resets
+// between measurement windows (e.g. once per layer) rather than a single
+// end-of-run summary. See docs/performance_model.md for exactly how each
+// field is computed and what it does/doesn't account for.
+struct PerfCounters {
+    uint64_t mac_ops = 0;           // utilized multiply-accumulates actually performed
+    uint64_t mac_capacity_ops = 0;  // rows*cols*compute_cycles: the array's ideal max over the same cycles
+    uint64_t compute_cycles = 0;    // cycles spent doing MAC-array compute (sum of K per tile)
+    uint64_t load_cycles = 0;       // cycles spent staging tiles into the local buffers
+    uint64_t tile_count = 0;        // number of MAC-array tiles processed
+    uint64_t activation_bytes_loaded = 0;  // bytes written into the activation buffer
+    uint64_t weight_bytes_loaded = 0;      // bytes written into the weight buffer
+
+    uint64_t totalCycles() const { return compute_cycles + load_cycles; }
+
+    // Fraction of the array's PEs doing useful work, averaged over compute
+    // cycles (not blended with load-cycle idle time -- see performance_model.md
+    // for why that split is drawn where it is).
+    double macUtilization() const {
+        return mac_capacity_ops == 0 ? 0.0
+                                      : static_cast<double>(mac_ops) / static_cast<double>(mac_capacity_ops);
+    }
+
+    void reset() { *this = PerfCounters{}; }
+
+    PerfCounters& operator+=(const PerfCounters& other) {
+        mac_ops += other.mac_ops;
+        mac_capacity_ops += other.mac_capacity_ops;
+        compute_cycles += other.compute_cycles;
+        load_cycles += other.load_cycles;
+        tile_count += other.tile_count;
+        activation_bytes_loaded += other.activation_bytes_loaded;
+        weight_bytes_loaded += other.weight_bytes_loaded;
+        return *this;
+    }
 };
 
 // Ties MacArray + LocalBuffers together into the "tiled execution" stage of
@@ -176,11 +224,19 @@ public:
     Tensor<int32_t> fullyConnected(const Tensor<int8_t>& x, const Tensor<int8_t>& weight,
                                     const std::optional<Tensor<int32_t>>& bias = std::nullopt);
 
+    // Performance counters accumulated across every conv2d/fullyConnected
+    // call since construction or the last resetStats(). Call resetStats()
+    // before a layer to get that layer's stats in isolation (layer-by-layer
+    // profiling), or leave it running to get a whole-run total.
+    const PerfCounters& stats() const { return stats_; }
+    void resetStats() { stats_.reset(); }
+
 private:
     AcceleratorConfig config_;
     MacArray mac_array_;
     LocalBuffer<int8_t> activation_buffer_;
     LocalBuffer<int8_t> weight_buffer_;
+    PerfCounters stats_;
 };
 
 }  // namespace accel

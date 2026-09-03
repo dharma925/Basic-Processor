@@ -291,9 +291,37 @@ reinforcing (on real data, not just `test_accelerator.cpp`'s synthetic tensors) 
 tiling the workload onto a MAC array changes nothing about the answer — only, from
 Phase 2 onward, how long it takes to get there.
 
+## Performance model (Phase 2)
+
+`Accelerator` is now instrumented with `PerfCounters` — MAC operation counts,
+estimated cycles, buffer traffic, MAC utilization, accumulated the way a hardware
+performance-monitoring unit's counters would be (free-running, read/reset at
+whatever measurement boundary the caller wants). The full cycle model — exact
+formulas, what it does and does not claim to capture, and real measured numbers from
+running the trained model — is documented in `docs/performance_model.md`, not
+duplicated here.
+
+One thing worth noting at the architecture level: adding `PerfCounters` to
+`Accelerator` and not to `ops.hpp`'s flat reference functions is itself a design
+statement. Performance modeling only makes sense once there's a hardware-shaped
+execution structure (tiles, a MAC array, buffers) to attach counters to — the flat
+reference was always only about correctness, and stays that way.
+
+**A real bug this phase surfaced.** Wiring `Accelerator::fullyConnected` into
+`mnist_infer`'s comparison loop (previously it always called the flat
+`fully_connected`, regardless of which conv path was being tested — see
+`src/mnist_infer.cpp`'s `forward()`) immediately hit `LocalBuffer`'s capacity check:
+the real FC layer's weight tile is `(K=1568, c_tile<=mac_cols)` elements, up to 6,272
+for a 4x4 array, bigger than the 4,096-element default buffer sized for the small
+examples in `test_accelerator.cpp`. `mnist_infer` now configures larger buffers
+explicitly to fit this real workload, and `test_accelerator.cpp` gained a regression
+test pinning down both the failing case (buffer too small) and the passing case
+(buffer sized for the workload). Left here deliberately rather than edited out of the
+narrative: it's a genuine example of "buffer size has to match the workload it
+runs," found by actually running the model, not a hypothetical.
+
 ## Next
 
-Phase 2: instrument the accelerator model with cycle/traffic counters — MAC
-operation counts, estimated cycles, memory reads/writes, buffer accesses, MAC
-utilization — and document the cycle model this project actually uses (not claiming
-RTL accuracy it doesn't have).
+Phase 3: run the same trained model through multiple MAC array configurations
+(4x4/8x8/16x16), tabulate the results, and identify at least one real bottleneck with
+evidence from `PerfCounters` — not asserted, measured.

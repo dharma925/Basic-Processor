@@ -2,10 +2,11 @@
 // exported by scripts/export_int8.py and runs conv1 -> relu -> requantize ->
 // maxpool -> flatten -> fc on each exported test image.
 //
-// Runs the *same* pipeline through two different conv implementations --
-// the flat reference (accel::conv2d, ops.hpp) and the tiled MAC-array model
-// (Accelerator::conv2d) -- and checks they agree on real data, not just the
-// synthetic random tensors in test_accelerator.cpp. Writes results/
+// Runs the *same* pipeline through two full implementations end to end --
+// the flat reference (accel::conv2d + accel::fully_connected, ops.hpp) and
+// the tiled MAC-array model (Accelerator::conv2d + Accelerator::fullyConnected)
+// -- and checks they agree on real data, not just the synthetic random
+// tensors in test_accelerator.cpp. Writes results/
 // cpp_predictions.csv, which scripts/compare_cpp_python.py then diffs
 // against the independent numpy reference (quantized_reference.py) -- the
 // actual "Python result vs C++ functional model" comparison the project
@@ -23,13 +24,17 @@ using namespace accel;
 
 namespace {
 
-// Runs the shared forward pass through whichever conv implementation is
-// passed in. Templated on the callable type so the exact same pipeline code
-// drives both accel::conv2d (a free function) and Accelerator::conv2d (a
-// bound member function, passed in via a lambda) without duplicating the
-// four lines in between.
-template <typename ConvFn>
-Tensor<int32_t> forward(ConvFn conv, const Tensor<int8_t>& image, const WeightLoader& weights,
+// Runs the shared forward pass through whichever conv/fc implementations are
+// passed in. Templated on both callable types so the exact same pipeline
+// code drives either the flat reference (accel::conv2d + accel::fully_connected)
+// or the tiled MAC-array model (Accelerator::conv2d + Accelerator::fullyConnected)
+// end to end, without duplicating the four lines in between. Earlier this
+// only templated on the conv step and always called the flat fully_connected
+// -- which meant Accelerator::fullyConnected was never actually exercised on
+// real data. Fixed here so "Accelerator matches the flat reference" is a
+// claim about the whole model, not just the conv layer.
+template <typename ConvFn, typename FcFn>
+Tensor<int32_t> forward(ConvFn conv, FcFn fc, const Tensor<int8_t>& image, const WeightLoader& weights,
                          float requant_scale_conv1) {
     Tensor<int32_t> acc = conv(image, weights.int8("conv1_weight"), weights.int32("conv1_bias"),
                                 /*stride=*/1, /*padding=*/1);
@@ -37,7 +42,7 @@ Tensor<int32_t> forward(ConvFn conv, const Tensor<int8_t>& image, const WeightLo
     Tensor<int8_t> activ = requantize(acc, static_cast<double>(requant_scale_conv1));
     Tensor<int8_t> pooled = maxpool2d(activ, /*kernel=*/2, /*stride=*/2);
     Tensor<int8_t> flat = pooled.reshape({pooled.size()});
-    return fully_connected(flat, weights.int8("fc_weight"), weights.int32("fc_bias"));
+    return fc(flat, weights.int8("fc_weight"), weights.int32("fc_bias"));
 }
 
 size_t argmax(const Tensor<int32_t>& logits) {
@@ -65,7 +70,15 @@ int main(int argc, char** argv) {
     const size_t image_w = test_images.shape()[3];
     const size_t image_elems = image_c * image_h * image_w;
 
-    AcceleratorConfig cfg;  // defaults: 4x4 MAC array
+    AcceleratorConfig cfg;  // 4x4 MAC array (default)
+    // The default 4096-element buffer (sized for the small examples in
+    // test_accelerator.cpp) is too small for this model's real FC layer: its
+    // weight tile is (K=1568, c_tile<=mac_cols) elements, i.e. up to 1568*4 =
+    // 6272 for the default 4x4 array -- bigger than 4096. Sized explicitly
+    // here to fit that real workload; discovered by actually running this
+    // program and hitting LocalBuffer's capacity check, not chosen in advance.
+    cfg.weight_buffer_elems = 8192;
+    cfg.activation_buffer_elems = 8192;
     Accelerator accel_model(cfg);
 
     std::filesystem::create_directories(std::filesystem::path(output_path).parent_path());
@@ -88,12 +101,18 @@ int main(int argc, char** argv) {
         Tensor<int32_t> logits_ref = forward(
             [](const Tensor<int8_t>& in, const Tensor<int8_t>& w, const Tensor<int32_t>& b,
                size_t stride, size_t padding) { return conv2d(in, w, b, stride, padding); },
+            [](const Tensor<int8_t>& xx, const Tensor<int8_t>& w, const Tensor<int32_t>& b) {
+                return fully_connected(xx, w, b);
+            },
             image, weights, requant_scale_conv1);
 
         Tensor<int32_t> logits_acc = forward(
             [&accel_model](const Tensor<int8_t>& in, const Tensor<int8_t>& w, const Tensor<int32_t>& b,
                             size_t stride, size_t padding) {
                 return accel_model.conv2d(in, w, b, stride, padding);
+            },
+            [&accel_model](const Tensor<int8_t>& xx, const Tensor<int8_t>& w, const Tensor<int32_t>& b) {
+                return accel_model.fullyConnected(xx, w, b);
             },
             image, weights, requant_scale_conv1);
 
@@ -122,5 +141,52 @@ int main(int argc, char** argv) {
               << " image(s) where Accelerator's tiled path disagreed with the flat reference "
                  "(expect 0)\n";
     std::cout << "wrote " << output_path << "\n";
+
+    // Performance characterization: only the Accelerator path has anything
+    // to report here -- accel::conv2d (the flat reference) has no notion of
+    // tiling or cycles, which is exactly why Accelerator exists. Cycle/
+    // utilization counts depend only on tensor *shapes* and AcceleratorConfig,
+    // not on pixel values, so profiling one image characterizes the whole
+    // model on this hardware config -- every other image would report the
+    // same numbers.
+    {
+        Tensor<int8_t> image0({image_c, image_h, image_w});
+        std::copy(test_images.data(), test_images.data() + image_elems, image0.data());
+
+        accel_model.resetStats();
+        Tensor<int32_t> conv_acc = accel_model.conv2d(image0, weights.int8("conv1_weight"),
+                                                        weights.int32("conv1_bias"),
+                                                        /*stride=*/1, /*padding=*/1);
+        PerfCounters conv_stats = accel_model.stats();
+
+        relu_inplace(conv_acc);
+        Tensor<int8_t> activ = requantize(conv_acc, static_cast<double>(requant_scale_conv1));
+        Tensor<int8_t> pooled = maxpool2d(activ, /*kernel=*/2, /*stride=*/2);
+        Tensor<int8_t> flat = pooled.reshape({pooled.size()});
+
+        accel_model.resetStats();
+        accel_model.fullyConnected(flat, weights.int8("fc_weight"), weights.int32("fc_bias"));
+        PerfCounters fc_stats = accel_model.stats();
+
+        PerfCounters total = conv_stats;
+        total += fc_stats;
+
+        auto printLayer = [](const std::string& name, const PerfCounters& s) {
+            std::cout << name << ": tiles=" << s.tile_count << " mac_ops=" << s.mac_ops
+                      << " mac_capacity_ops=" << s.mac_capacity_ops << " utilization="
+                      << (s.macUtilization() * 100.0) << "% compute_cycles=" << s.compute_cycles
+                      << " load_cycles=" << s.load_cycles << " total_cycles=" << s.totalCycles()
+                      << " activation_bytes=" << s.activation_bytes_loaded
+                      << " weight_bytes=" << s.weight_bytes_loaded << "\n";
+        };
+
+        std::cout << "\n--- performance (Accelerator, " << cfg.mac_rows << "x" << cfg.mac_cols
+                  << " MAC array, " << cfg.buffer_bandwidth_elems_per_cycle
+                  << " elems/cycle buffer bandwidth) ---\n";
+        printLayer("conv1", conv_stats);
+        printLayer("fc   ", fc_stats);
+        printLayer("total", total);
+    }
+
     return 0;
 }
