@@ -52,6 +52,7 @@ package tb_base_pkg;
   // recognizable.
   class my_sequencer #(type T = my_sequence_item) extends my_component;
     mailbox #(T) req_mbx;
+    event        item_done_ev;
     function new(string name = "my_sequencer");
       super.new(name);
       req_mbx = new();
@@ -60,9 +61,7 @@ package tb_base_pkg;
       req_mbx.get(item);
     endtask
     function void item_done();
-      // present for API symmetry with uvm_sequencer; this environment's
-      // driver reports completion by filling in the item's response
-      // fields directly (the sequence already holds the same handle).
+      -> item_done_ev;
     endfunction
   endclass
 
@@ -76,14 +75,37 @@ package tb_base_pkg;
       sqr.req_mbx.put(item);
     endtask
     task automatic finish_item(T item);
-      // synchronous driver: by the time the driver moves on to the next
-      // mailbox item, this one's response fields are already populated.
+      // blocks until the driver calls sqr.item_done() for this item, so
+      // the item's response fields are guaranteed populated once this
+      // returns (single-outstanding: only one item is ever in flight).
+      @(sqr.item_done_ev);
     endtask
     pure virtual task body();
     task automatic start(my_sequencer#(T) sqr);
       set_sequencer(sqr);
       body();
     endtask
+  endclass
+
+  // ---- lightweight pass/fail tally, used by directed sequences for
+  //      explicit self-checks in addition to whatever the scoreboard
+  //      already verifies automatically ---------------------------------
+  class test_report;
+    static int num_checks = 0;
+    static int num_fails  = 0;
+    static function void check(bit cond, string msg);
+      num_checks++;
+      if (!cond) begin
+        num_fails++;
+        // $display, not $error: our simulator treats $error as fatal
+        // (aborts immediately), which would stop a directed sequence
+        // after its first failed check instead of tallying all of them.
+        $display("CHECK FAILED: %s", msg);
+      end
+    endfunction
+    static function void summary();
+      $display("TEST_REPORT: checks=%0d fails=%0d", num_checks, num_fails);
+    endfunction
   endclass
 
 endpackage

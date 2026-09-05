@@ -12,6 +12,48 @@ interface apb_if #(parameter int ADDR_WIDTH = 5) (input logic pclk, input logic 
   logic                  pslverr;
 
   // ---------------------------------------------------------------------
+  // Passive monitor loop and reference-model tick loop live here rather
+  // than as class tasks taking a `virtual apb_if` parameter, for the same
+  // reason axi_lite_if.sv's monitor_loop() does - see that file's header.
+  // This does mean the interface now names apb_txn/gpt_ref_model/
+  // tb_base_pkg, an unusual dependency direction forced by working around
+  // that simulator bug; see docs/README's Toolchain section.
+  // ---------------------------------------------------------------------
+  task automatic monitor_loop(tb_base_pkg::my_analysis_port #(apb_txn) ap);
+    int wait_cnt;
+    wait_cnt = 0;
+    forever begin
+      @(negedge pclk);
+      if (!presetn) begin
+        wait_cnt = 0;
+        continue;
+      end
+      if (psel && penable) begin
+        if (!pready) begin
+          wait_cnt++;
+        end else begin
+          apb_txn t = new("apb_obs");
+          t.write       = pwrite;
+          t.addr        = paddr;
+          t.data        = pwrite ? pwdata : prdata;
+          t.slverr      = pslverr;
+          t.wait_cycles = wait_cnt;
+          ap.write(t);
+          wait_cnt = 0;
+        end
+      end
+    end
+  endtask
+
+  task automatic run_ref_model(gpt_ref_model model);
+    forever begin
+      @(posedge pclk);
+      if (!presetn) model.reset();
+      else          model.tick(psel && penable && pready && pwrite, paddr, pwdata);
+    end
+  endtask
+
+  // ---------------------------------------------------------------------
   // SVA: APB protocol legality checks (P0 requirement: 4-6 assertions)
   // ---------------------------------------------------------------------
 
